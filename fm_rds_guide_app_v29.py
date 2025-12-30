@@ -1114,12 +1114,17 @@ class CaptureConfig:
         return dict(self.tool_overrides) if isinstance(self.tool_overrides, dict) else {}
 
 
-def decode_rds_for_station(cfg: CaptureConfig, event_q: "queue.Queue[dict]", db_path: str, power_db: float | None) -> None:
+def decode_rds_for_station(cfg: CaptureConfig, event_q: "queue.Queue[dict]", db_path: str, power_db: float | None) -> tuple[bool, int]:
     """
     Capture IQ with hackrf_transfer, demod WBFM to MPX, then decode RDS/RBDS with redsea.
 
     This function runs in a background thread. It MUST NOT call Streamlit APIs.
     It communicates exclusively via `event_q`.
+    
+    Returns:
+        (success: bool, num_groups: int)
+        - success=True if at least one RDS group was decoded
+        - num_groups: total number of groups decoded
     """
     station_freq_hz = int(cfg.center_freq_hz - cfg.offset_hz)
     center_freq_hz = int(cfg.center_freq_hz)
@@ -1148,9 +1153,14 @@ def decode_rds_for_station(cfg: CaptureConfig, event_q: "queue.Queue[dict]", db_
     mpx_clip_samples = 0
     mpx_total_samples = 0
 
-
     # Diagnostic cadence
     diag_interval_s = 1.0
+
+    # Early exit tracking
+    min_groups_to_proceed = 1  # Move on after decoding at least 1 group
+    check_interval_s = 1.0  # Check every second if we can exit early
+    decoded_groups_so_far = 0
+    last_check = 0.0
 
     emit_event(event_q, {
         "type": "debug",
@@ -1185,7 +1195,7 @@ def decode_rds_for_station(cfg: CaptureConfig, event_q: "queue.Queue[dict]", db_
         )
     except Exception as e:
         emit_event(event_q, {"type": "error", "msg": f"hackrf_transfer failed to start: {e}", "ts": iso_utc_now()})
-        return
+        return (False, 0)
 
     # DSP state
     chan = ComplexFIRDecimator(fs_in=fs_in, decim=decim, cutoff_hz=cutoff_hz)
@@ -1207,7 +1217,7 @@ def decode_rds_for_station(cfg: CaptureConfig, event_q: "queue.Queue[dict]", db_
     diag_next = t0
     t_end = t0 + float(cfg.seconds_per_station)
 
-    # Consume chunks until time elapsed
+    # Consume chunks until time elapsed OR we've decoded enough
     try:
         while time.time() < t_end:
             iq = transfer.read_iq()
@@ -1250,7 +1260,55 @@ def decode_rds_for_station(cfg: CaptureConfig, event_q: "queue.Queue[dict]", db_
             pcm_i16 = (mpx_norm * 32767.0).astype(np.int16)
             pcm_chunks.append(pcm_i16)
             total_pcm_samples += int(pcm_i16.size)
+            
             now = time.time()
+            
+            # Periodically check if we can exit early
+            if now >= last_check + check_interval_s:
+                # Quick check: try to decode what we have so far
+                if len(pcm_chunks) > 0 and (now - t0) >= 2.0:  # Wait at least 2 seconds
+                    # Write temporary WAV and attempt decode
+                    pcm_temp = np.concatenate(pcm_chunks)
+                    wav_temp_path = str(Path(db_path).with_suffix(".temp_check.wav"))
+                    
+                    try:
+                        with wave.open(wav_temp_path, "wb") as wf:
+                            wf.setnchannels(1)
+                            wf.setsampwidth(2)
+                            wf.setframerate(fs_out)
+                            wf.writeframes(pcm_temp.tobytes())
+                        
+                        redsea_check = RedseaDecoder(tools["redsea"])
+                        groups_check, _, _, _, _ = redsea_check.decode_wav(
+                            wav_temp_path,
+                            rbds=True,
+                            show_partial=True,
+                            time_from_start=True,
+                            timeout_s=5.0,
+                        )
+                        
+                        decoded_groups_so_far = len(groups_check)
+                        
+                        # Clean up temp file
+                        try:
+                            Path(wav_temp_path).unlink()
+                        except Exception:
+                            pass
+                        
+                        # Exit early if we have enough groups
+                        if decoded_groups_so_far >= min_groups_to_proceed:
+                            emit_event(event_q, {
+                                "type": "info",
+                                "msg": f"Early exit: decoded {decoded_groups_so_far} groups at {station_freq_hz/1e6:.1f} MHz after {now-t0:.1f}s",
+                                "ts": iso_utc_now(),
+                            })
+                            break
+                            
+                    except Exception:
+                        pass  # Continue capturing if check fails
+                
+                last_check = now
+            
             if now >= diag_next:
                 # Pilot (19 kHz) and RDS (57 kHz) "tone-ish" SNR estimates.
                 # Note: RDS is BPSK spread over a few kHz; use wider measurement bandwidth.
@@ -1298,8 +1356,8 @@ def decode_rds_for_station(cfg: CaptureConfig, event_q: "queue.Queue[dict]", db_
                     "rds_snr_db": rds_snr_db,
                     "agc_rms": float(agc_rms),
                     "mpx_rms": mpx_rms,
-            "mpx_clip_pct": (100.0 * mpx_clip_samples / max(1, mpx_total_samples)),
-            "ts": iso_utc_now(),
+                    "mpx_clip_pct": (100.0 * mpx_clip_samples / max(1, mpx_total_samples)),
+                    "ts": iso_utc_now(),
                 })
 
                 # Cache latest diag for final warning context
@@ -1455,6 +1513,10 @@ def decode_rds_for_station(cfg: CaptureConfig, event_q: "queue.Queue[dict]", db_
             ),
             "ts": iso_utc_now(),
         })
+    
+    # Return success status
+    return (len(decoded) > 0, len(decoded))
+
 
 def run_scan(scan_method: str,
              fm_min_mhz: float,
@@ -1498,7 +1560,8 @@ class MonitorController:
         self.running = False
 
     def start(self, station_list: List[Tuple[int, float]], capture_fs: int, decim: int,
-              vga: int, lna: int, amp: bool, seconds_per_station: float, offset_hz: int):
+              vga: int, lna: int, amp: bool, seconds_per_station: float, offset_hz: int,
+              continuous: bool = True):
         if self.running:
             return
         self._stop_evt.clear()
@@ -1507,42 +1570,80 @@ class MonitorController:
 
         def run():
             try:
-                for freq_hz, power_db in station_list:
+                cycle_count = 0
+                while True:  # Infinite loop for continuous scanning
+                    cycle_count += 1
+                    self.event_q.put({
+                        "type": "status",
+                        "msg": f"Starting scan cycle #{cycle_count}...",
+                        "ts": now_utc_iso()
+                    })
+                    
+                    for freq_hz, power_db in station_list:
+                        if self._stop_evt.is_set():
+                            break
+                        
+                        self.event_q.put({
+                            "type": "status",
+                            "msg": f"Cycle #{cycle_count}: Tuning {fmt_freq(freq_hz)}…",
+                            "ts": now_utc_iso()
+                        })
+                        
+                        fs_out = int(capture_fs) // max(1, int(decim))
+                        cutoff_hz = int(min(160_000, 0.49 * fs_out))
+                        # Quantize/clamp gains to HackRF supported ranges
+                        lna_req = int(lna)
+                        vga_req = int(vga)
+                        lna_applied = clamp_hackrf_lna_db(lna_req)
+                        vga_applied = clamp_hackrf_vga_db(vga_req)
+                        if (lna_applied != lna_req) or (vga_applied != vga_req):
+                            self.event_q.put({
+                                "type": "debug",
+                                "stage": "gain_quantize",
+                                "requested": {"lna_db": lna_req, "vga_db": vga_req},
+                                "applied": {"lna_db": lna_applied, "vga_db": vga_applied},
+                                "ts": now_utc_iso(),
+                            })
+                        cfg = CaptureConfig(
+                            station_freq_hz=int(freq_hz),
+                            center_freq_hz=int(freq_hz) + int(offset_hz),
+                            offset_hz=int(offset_hz),
+                            sample_rate_hz=int(capture_fs),
+                            decim=int(decim),
+                            cutoff_hz=cutoff_hz,
+                            lna_db=int(lna_applied),
+                            vga_db=int(vga_applied),
+                            amp=bool(amp),
+                            seconds=float(seconds_per_station),
+                            tool_overrides=tool_overrides,
+                        )
+
+                        success, n_groups = decode_rds_for_station(
+                            cfg, self.event_q, self.db_path, power_db=float(power_db)
+                        )
+                        
+                        if success:
+                            self.event_q.put({
+                                "type": "info",
+                                "msg": f"✓ {fmt_freq(freq_hz)}: decoded {n_groups} groups",
+                                "ts": now_utc_iso()
+                            })
+                    
                     if self._stop_evt.is_set():
                         break
-                    self.event_q.put({"type": "status", "msg": f"Tuning {fmt_freq(freq_hz)}…", "ts": now_utc_iso()})
-                    fs_out = int(capture_fs) // max(1, int(decim))
-                    cutoff_hz = int(min(160_000, 0.49 * fs_out))
-                    # Quantize/clamp gains to HackRF supported ranges
-                    lna_req = int(lna)
-                    vga_req = int(vga)
-                    lna_applied = clamp_hackrf_lna_db(lna_req)
-                    vga_applied = clamp_hackrf_vga_db(vga_req)
-                    if (lna_applied != lna_req) or (vga_applied != vga_req):
-                        self.event_q.put({
-                            "type": "debug",
-                            "stage": "gain_quantize",
-                            "requested": {"lna_db": lna_req, "vga_db": vga_req},
-                            "applied": {"lna_db": lna_applied, "vga_db": vga_applied},
-                            "ts": now_utc_iso(),
-                        })
-                    cfg = CaptureConfig(
-                        station_freq_hz=int(freq_hz),
-                        center_freq_hz=int(freq_hz) + int(offset_hz),
-                        offset_hz=int(offset_hz),
-                        sample_rate_hz=int(capture_fs),
-                        decim=int(decim),
-                        cutoff_hz=cutoff_hz,
-                        lna_db=int(lna_applied),
-                        vga_db=int(vga_applied),
-                        amp=bool(amp),
-                        seconds=float(seconds_per_station),
-                        tool_overrides=tool_overrides,
-                    )
-
-                    decode_rds_for_station(cfg, self.event_q, self.db_path, power_db=float(power_db))
+                        
+                    if not continuous:
+                        break
+                        
+                    # Brief pause between cycles
+                    time.sleep(2.0)
+                    
             finally:
-                self.event_q.put({"type": "status", "msg": "Monitor loop stopped.", "ts": now_utc_iso()})
+                self.event_q.put({
+                    "type": "status",
+                    "msg": "Monitor loop stopped.",
+                    "ts": now_utc_iso()
+                })
                 self.running = False
 
         self._thread = threading.Thread(target=run, daemon=True)
@@ -1835,7 +1936,7 @@ def monitor_panel():
         lna = st.number_input("Transfer LNA (dB)", value=int(TRANSFER_LNA_DB_DEFAULT), step=8)
         amp = st.checkbox("Transfer RF amp", value=bool(TRANSFER_AMP_DEFAULT))
     with c3:
-        sec = st.number_input("Seconds per station", value=float(CAPTURE_SECONDS_DEFAULT), step=1.0, min_value=1.0, max_value=30.0)
+        sec = st.number_input("Max seconds per station", value=float(CAPTURE_SECONDS_DEFAULT), step=1.0, min_value=1.0, max_value=30.0)
         offset_hz = st.number_input(
             "Offset tune (Hz)",
             min_value=0,
@@ -1845,6 +1946,12 @@ def monitor_panel():
             help="Tunes to station+offset and digitally mixes down. Helps reject DC spike and improves RDS.",
         )
 
+    continuous_mode = st.checkbox(
+        "🔄 Continuous scanning mode",
+        value=True,
+        help="Keep cycling through all stations. Moves to next station once RDS is decoded."
+    )
+
     fs_out = int(cap_fs) // int(decim)
     st.caption(f"MPX sample rate to redsea: ~{fs_out} Hz (should be >114 kHz for RDS @57 kHz).")
 
@@ -1852,8 +1959,11 @@ def monitor_panel():
     colA, colB = st.columns(2)
     with colA:
         if st.button("📡 Start decoding", type="primary", disabled=mon.running):
-            mon.start(selected, int(cap_fs), int(decim), int(vga), int(lna), bool(amp), float(sec), int(offset_hz))
-            st.toast("Decoding started.")
+            mon.start(
+                selected, int(cap_fs), int(decim), int(vga), int(lna),
+                bool(amp), float(sec), int(offset_hz), continuous=continuous_mode
+            )
+            st.toast("Decoding started in continuous mode." if continuous_mode else "Decoding started.")
     with colB:
         if st.button("🛑 Stop", disabled=not mon.running):
             mon.stop()
@@ -1896,6 +2006,7 @@ def monitor_panel():
         if ev.get("type") == "error":
             st.error(ev.get("msg"))
             break
+
 
 def timeline_panel(conn: sqlite3.Connection, freq_hz: int):
     hist = db_load_history(conn, freq_hz=freq_hz, limit=2000)
